@@ -1,134 +1,68 @@
--- ================================================
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
-GO
--- =============================================
--- Author:		Sivaraman
--- Create date: June 18, 2026
--- Description:RDS	Database backup to s3 report 
--- =============================================
 CREATE PROCEDURE RDS_BackupStatusReport
-	
 AS
 BEGIN
-	
-	SET NOCOUNT ON;
-	DECLARE @ReportDate      DATE     = CAST(GETDATE() AS DATE);
-DECLARE @Html            NVARCHAR(MAX);
-DECLARE @Rows            NVARCHAR(MAX);
-DECLARE @Summary         NVARCHAR(MAX);
+    SET NOCOUNT ON;
 
--- Polling controls
-DECLARE @PollDelayMin    INT      = 5;        -- check every 5 minutes
-DECLARE @LoopStart       DATETIME = GETDATE();
-DECLARE @PendingCount    INT      = 1;
-DECLARE @TimedOut        BIT      = 0;
-DECLARE @PollCount       INT      = 0;        -- how many polls done
+    DECLARE @ReportDate DATE = CAST(GETDATE() AS DATE);
+    DECLARE @Html NVARCHAR(MAX);
+    DECLARE @Rows NVARCHAR(MAX);
+    DECLARE @Summary NVARCHAR(MAX);
 
-IF OBJECT_ID('tempdb..#TaskList')   IS NOT NULL DROP TABLE #TaskList;
-IF OBJECT_ID('tempdb..#TaskStatus') IS NOT NULL DROP TABLE #TaskStatus;
-IF OBJECT_ID('tempdb..#Report')     IS NOT NULL DROP TABLE #Report;
+    ------------------------------------------------------------
+    -- Temp tables
+    ------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#TaskList')   IS NOT NULL DROP TABLE #TaskList;
+    IF OBJECT_ID('tempdb..#TaskStatus') IS NOT NULL DROP TABLE #TaskStatus;
+    IF OBJECT_ID('tempdb..#Report')     IS NOT NULL DROP TABLE #Report;
 
-------------------------------------------------------------
--- 1) Collect backup commands + related task_id
-------------------------------------------------------------
-CREATE TABLE #TaskList
-(
-    CommandLogID   INT,
-    DatabaseName   SYSNAME,
-    CommandType    NVARCHAR(60),
-    StartTime      DATETIME,
-    EndTime        DATETIME,
-    ErrorNumber    INT NULL,
-    ErrorMessage   NVARCHAR(MAX) NULL,
-    TaskLogID      INT,
-    TaskID         INT
-);
+    ------------------------------------------------------------
+    -- 1. Collect backup tasks
+    ------------------------------------------------------------
+    CREATE TABLE #TaskList
+    (
+        CommandLogID INT,
+        DatabaseName SYSNAME,
+        StartTime DATETIME,
+        EndTime DATETIME,
+        TaskID INT
+    );
 
-INSERT INTO #TaskList
-(
-    CommandLogID, DatabaseName, CommandType,
-    StartTime, EndTime, ErrorNumber, ErrorMessage,
-    TaskLogID, TaskID
-)
-SELECT
-    cl.ID,
-    cl.DatabaseName,
-    cl.CommandType,
-    cl.StartTime,
-    cl.EndTime,
-    cl.ErrorNumber,
-    cl.ErrorMessage,
-    bl.ID,
-    bl.task_id
-FROM dbo.RDS_CommandLog cl
-INNER JOIN dbo.RDS_BackupLog bl
-    ON bl.ID = cl.ID
-WHERE cl.CommandType = 'BACKUP_DATABASE'
-  AND CAST(cl.StartTime AS DATE) = @ReportDate
-  AND bl.task_id IS NOT NULL;
+    INSERT INTO #TaskList
+    SELECT 
+        cl.ID,
+        cl.DatabaseName,
+        cl.StartTime,
+        cl.EndTime,
+        bl.task_id
+    FROM dbo.RDS_CommandLog cl
+    JOIN dbo.RDS_BackupLog bl ON cl.ID = bl.ID
+    WHERE cl.CommandType = 'BACKUP_DATABASE'
+    AND CAST(cl.StartTime AS DATE) = @ReportDate;
 
-------------------------------------------------------------
--- 2) Temp table for rds_task_status output
-------------------------------------------------------------
-CREATE TABLE #TaskStatus
-(
-    task_id                  INT            NULL,
-    task_type                NVARCHAR(100)  NULL,
-    database_name            NVARCHAR(256)  NULL,
-    percent_complete         INT            NULL,
-    duration_mins            INT            NULL,
-    lifecycle                NVARCHAR(60)   NULL,
-    task_info                NVARCHAR(MAX)  NULL,
-    last_updated             DATETIME       NULL,
-    created_at               DATETIME       NULL,
-    S3_object_arn            NVARCHAR(4000) NULL,
-    overwrite_S3_backup_file INT            NULL,
-    KMS_master_key_arn       NVARCHAR(4000) NULL,
-    filepath                 NVARCHAR(4000) NULL,
-    overwrite_file           INT            NULL
-);
-
-------------------------------------------------------------
--- 3) Poll every 5 minutes until all tasks complete
---    CREATED / IN_PROGRESS
-------------------------------------------------------------
-WHILE @PendingCount > 0
-BEGIN
-    SET @PollCount = @PollCount + 1;
-
-    TRUNCATE TABLE #TaskStatus;
+    ------------------------------------------------------------
+    -- 2. Get Task Status
+    ------------------------------------------------------------
+    CREATE TABLE #TaskStatus (
+        task_id INT,
+        lifecycle NVARCHAR(50),
+        percent_complete INT,
+        last_updated DATETIME,
+        S3_object_arn NVARCHAR(MAX),
+        task_info NVARCHAR(MAX)
+    );
 
     DECLARE @TaskID INT;
-    DECLARE curTask CURSOR LOCAL FAST_FORWARD FOR
-        SELECT DISTINCT TaskID FROM #TaskList ORDER BY TaskID;
+
+    DECLARE curTask CURSOR FOR
+        SELECT TaskID FROM #TaskList;
 
     OPEN curTask;
     FETCH NEXT FROM curTask INTO @TaskID;
 
     WHILE @@FETCH_STATUS = 0
     BEGIN
-        BEGIN TRY
-            INSERT INTO #TaskStatus
-            EXEC msdb.dbo.rds_task_status @task_id = @TaskID;
-        END TRY
-        BEGIN CATCH
-            INSERT INTO #TaskStatus
-            (
-                task_id, task_type, database_name,
-                percent_complete, duration_mins, lifecycle,
-                task_info, last_updated, created_at,
-                S3_object_arn, overwrite_S3_backup_file,
-                KMS_master_key_arn, filepath, overwrite_file
-            )
-            VALUES
-            (
-                @TaskID, NULL, NULL, NULL, NULL, 'ERROR',
-                ERROR_MESSAGE(), GETDATE(), GETDATE(),
-                NULL, NULL, NULL, NULL, NULL
-            );
-        END CATCH;
+        INSERT INTO #TaskStatus
+        EXEC msdb.dbo.rds_task_status @task_id = @TaskID;
 
         FETCH NEXT FROM curTask INTO @TaskID;
     END
@@ -136,396 +70,100 @@ BEGIN
     CLOSE curTask;
     DEALLOCATE curTask;
 
-    -- Count still-pending tasks
-    SELECT @PendingCount = COUNT(*)
-    FROM #TaskStatus
-    WHERE lifecycle IN ('CREATED', 'IN_PROGRESS');
+    ------------------------------------------------------------
+    -- 3. Build report
+    ------------------------------------------------------------
+    SELECT 
+        tl.DatabaseName,
+        tl.TaskID,
+        tl.StartTime,
+        tl.EndTime,
+        DATEDIFF(MINUTE, tl.StartTime, tl.EndTime) DurationMinutes,
+        ts.lifecycle,
+        ts.percent_complete,
+        ts.S3_object_arn,
+        ts.task_info
+    INTO #Report
+    FROM #TaskList tl
+    LEFT JOIN #TaskStatus ts ON tl.TaskID = ts.task_id;
 
-    -- Wait 5 minutes before next poll if tasks still pending
-    IF @PendingCount > 0
-    BEGIN
-        DECLARE @Delay CHAR(8);
-        SET @Delay = '00:0' + CAST(@PollDelayMin AS CHAR(1)) + ':00';
-        WAITFOR DELAY @Delay;
-    END
-END
+    ------------------------------------------------------------
+    -- 4. Summary
+    ------------------------------------------------------------
+    DECLARE @Success INT = (SELECT COUNT(*) FROM #Report WHERE lifecycle = 'SUCCESS');
+    DECLARE @Error INT   = (SELECT COUNT(*) FROM #Report WHERE lifecycle = 'ERROR');
+    DECLARE @Total INT   = (SELECT COUNT(*) FROM #Report);
 
+    SET @Summary = '
+    <table border="1" cellpadding="5" cellspacing="0">
+        <tr><th colspan="2">Backup Summary</th></tr>
+        <tr><td>Date</td><td>' + CONVERT(NVARCHAR, @ReportDate, 106) + '</td></tr>
+        <tr><td>Success</td><td>' + CAST(@Success AS NVARCHAR) + '</td></tr>
+        <tr><td>Failed</td><td>' + CAST(@Error AS NVARCHAR) + '</td></tr>
+        <tr><td>Total</td><td>' + CAST(@Total AS NVARCHAR) + '</td></tr>
+    </table><br/>';
 
-
-------------------------------------------------------------
--- 4) Keep latest status row per task_id
---    Parse first datetime from task_info as StartTime
---    Parse last datetime from task_info as EndTime
-------------------------------------------------------------
-;WITH TaskStatusLatest AS
-(
-    SELECT
-        ts.*,
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY ts.task_id
-            ORDER BY ISNULL(ts.last_updated, ts.created_at) DESC,
-                     ts.task_id DESC
-        ) AS rn
-    FROM #TaskStatus ts
-),
-TaskInfoTimes AS
-(
-    SELECT
-        tsl.task_id,
-
-        -- First [yyyy-mm-dd hh:mm:ss.mmm]
-        TRY_CAST(
-            CASE
-                WHEN tsl.task_info IS NOT NULL
-                 AND CHARINDEX('[', tsl.task_info) > 0
-                 AND CHARINDEX(']', tsl.task_info, CHARINDEX('[', tsl.task_info)) > 0
-                THEN SUBSTRING(
-                        tsl.task_info,
-                        CHARINDEX('[', tsl.task_info) + 1,
-                        CHARINDEX(']', tsl.task_info, CHARINDEX('[', tsl.task_info))
-                          - CHARINDEX('[', tsl.task_info) - 1
-                     )
-            END AS DATETIME
-        ) AS TaskActualStart,
-
-        -- Last [yyyy-mm-dd hh:mm:ss.mmm]
-        tsl.last_updated AS TaskActualEnd
-
-    FROM TaskStatusLatest tsl
-    WHERE tsl.rn = 1
-)
-SELECT
-    tl.CommandLogID,
-    tl.DatabaseName,
-    tl.CommandType,
-
-    -- Use first datetime from task_info as StartTime
-    ISNULL(tit.TaskActualStart, tl.StartTime) AS StartTime,
-
-    -- Use last datetime from task_info as EndTime
-    ISNULL(tit.TaskActualEnd, tl.EndTime) AS EndTime,
-
-    -- Duration based on parsed task_info timestamps
-    DATEDIFF
+    ------------------------------------------------------------
+    -- 5. Detail rows
+    ------------------------------------------------------------
+    SELECT @Rows =
     (
-        MINUTE,
-        ISNULL(tit.TaskActualStart, tl.StartTime),
-        ISNULL(tit.TaskActualEnd, tl.EndTime)
-    ) AS DurationMinutes,
+        SELECT
+        CASE 
+            WHEN lifecycle = 'SUCCESS' THEN '<tr style="background-color:#d4edda">'
+            WHEN lifecycle = 'ERROR' THEN '<tr style="background-color:#f8d7da">'
+            ELSE '<tr style="background-color:#fff3cd">'
+        END +
 
-    tl.ErrorNumber,
-    tl.ErrorMessage,
-    tl.TaskID,
-    tsl.task_type,
-    tsl.database_name AS task_database_name,
-    tsl.percent_complete,
-    tsl.duration_mins,
-    tsl.lifecycle,
-    tsl.task_info,
-    tsl.last_updated,
-    tsl.created_at,
-    tsl.S3_object_arn,
-    tsl.KMS_master_key_arn
-INTO #Report
-FROM #TaskList tl
-LEFT JOIN TaskStatusLatest tsl
-    ON tl.TaskID = tsl.task_id
-   AND tsl.rn = 1
-LEFT JOIN TaskInfoTimes tit
-    ON tit.task_id = tl.TaskID;
+        '<td>' + ISNULL(DatabaseName,'') + '</td>' +
+        '<td>' + CAST(TaskID AS NVARCHAR) + '</td>' +
+        '<td>' + CONVERT(NVARCHAR, StartTime, 120) + '</td>' +
+        '<td>' + CONVERT(NVARCHAR, EndTime, 120) + '</td>' +
+        '<td>' + CAST(DurationMinutes AS NVARCHAR) + '</td>' +
+        '<td>' + ISNULL(lifecycle,'') + '</td>' +
+        '<td>' + ISNULL(CAST(percent_complete AS NVARCHAR),'') + '%</td>' +
+        '<td>' + ISNULL(S3_object_arn,'') + '</td>' +
+        '</tr>'
+        FROM #Report
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)');
 
-------------------------------------------------------------
--- 5) Counts for summary
-------------------------------------------------------------
-DECLARE @TotalCount      INT = 0,
-        @SuccessCount    INT = 0,
-        @ErrorCount      INT = 0,
-        @InProgressCount INT = 0,
-        @CreatedCount    INT = 0,
-        @CancelledCount  INT = 0,
-        @OtherCount      INT = 0;
+    ------------------------------------------------------------
+    -- 6. Final HTML
+    ------------------------------------------------------------
+    SET @Html = '
+    <html>
+    <body style="font-family:Arial;font-size:12px;">
+    <h2>RDS SQL Server Backup Report</h2>
 
-SELECT @TotalCount      = COUNT(*)                                            FROM #Report;
-SELECT @SuccessCount    = COUNT(*) FROM #Report WHERE lifecycle = 'SUCCESS';
-SELECT @ErrorCount      = COUNT(*) FROM #Report WHERE lifecycle = 'ERROR';
-SELECT @InProgressCount = COUNT(*) FROM #Report WHERE lifecycle = 'IN_PROGRESS';
-SELECT @CreatedCount    = COUNT(*) FROM #Report WHERE lifecycle = 'CREATED';
-SELECT @CancelledCount  = COUNT(*) FROM #Report WHERE lifecycle IN ('CANCELLED','CANCEL_REQUESTED');
-SELECT @OtherCount      = COUNT(*)
-FROM #Report
-WHERE ISNULL(lifecycle,'') NOT IN
-      ('SUCCESS','ERROR','IN_PROGRESS','CREATED','CANCELLED','CANCEL_REQUESTED');
+    ' + @Summary + '
 
-DECLARE @TotalDuration INT;
-SELECT @TotalDuration = SUM(DurationMinutes) FROM #Report;
+    <table border="1" cellspacing="0" cellpadding="5">
+        <tr style="background-color:#1e3a5f;color:white;">
+            <th>Database</th>
+            <th>Task ID</th>
+            <th>Start Time</th>
+            <th>End Time</th>
+            <th>Duration</th>
+            <th>Status</th>
+            <th>% Done</th>
+            <th>S3 Path</th>
+        </tr>
+        ' + ISNULL(@Rows,'') + '
+    </table>
 
-------------------------------------------------------------
--- 6) Summary card HTML 
-------------------------------------------------------------
-SET @Summary = N'
-<table class="summary">
-  <tr>
-    <th colspan="2">Backup Run Summary</th>
-  </tr>
-  <tr><td>Report Date</td>
-      <td><strong>' + CONVERT(NVARCHAR(30), @ReportDate, 106) + N'</strong></td></tr>
-  <tr>
-    <td>DB Backup Completed</td>
-    <td><span class="badge badge-success">'    + CAST(@SuccessCount    AS NVARCHAR(10)) + N'</span></td>
-  </tr>
-  <tr>
-    <td>Failed</td>
-    <td><span class="badge badge-error">'      + CAST(@ErrorCount      AS NVARCHAR(10)) + N'</span></td>
-  </tr>
-  <tr>
-    <td>Total Backup Duration</td>
-    <td>' + CAST(ISNULL(@TotalDuration, 0) AS NVARCHAR(10)) + N' minutes</td>
-  </tr>
-</table><br/>';
+    </body>
+    </html>';
 
-------------------------------------------------------------
--- 7) Detailed rows HTML 
-------------------------------------------------------------
-SELECT @Rows =
-(
-    SELECT
-        N'<tr class="' + CASE
-            WHEN r.lifecycle = 'SUCCESS'    THEN 'row-success'
-            WHEN r.lifecycle = 'ERROR'      THEN 'row-error'
-            WHEN r.lifecycle IN ('IN_PROGRESS','CREATED') THEN 'row-progress'
-            WHEN r.lifecycle IN ('CANCELLED','CANCEL_REQUESTED') THEN 'row-cancelled'
-            ELSE 'row-other'
-        END + N'">'
-
-      -- Database
-      + N'<td><strong>'
-            + ISNULL(REPLACE(REPLACE(REPLACE(r.DatabaseName,'&','&amp;'),'<','&lt;'),'>','&gt;'), '')
-        + N'</strong></td>'
-
-      -- Task ID
-      + N'<td style="text-align:center;">'
-            + ISNULL(CAST(r.TaskID AS NVARCHAR(20)), '')
-        + N'</td>'
-
-      -- Start Time
-      + N'<td>' + ISNULL(CONVERT(NVARCHAR(19), r.StartTime, 120), '') + N'</td>'
-
-      -- End Time
-      + N'<td>' + ISNULL(CONVERT(NVARCHAR(19), r.EndTime, 120), '') + N'</td>'
-
-      -- Duration
-      + N'<td style="text-align:center;">'
-            + ISNULL(CAST(r.DurationMinutes AS NVARCHAR(20)), '&mdash;')
-        + N' min</td>'
-
-      -- Lifecycle badge
-      + N'<td style="text-align:center;">'
-            + CASE r.lifecycle
-                WHEN 'SUCCESS'          THEN N'<span class="badge badge-success">SUCCESS</span>'
-                WHEN 'ERROR'            THEN N'<span class="badge badge-error">ERROR</span>'
-                WHEN 'IN_PROGRESS'      THEN N'<span class="badge badge-progress">IN PROGRESS</span>'
-                WHEN 'CREATED'          THEN N'<span class="badge badge-created">CREATED</span>'
-                WHEN 'CANCELLED'        THEN N'<span class="badge badge-cancelled">CANCELLED</span>'
-                WHEN 'CANCEL_REQUESTED' THEN N'<span class="badge badge-cancelled">CANCEL REQUESTED</span>'
-                ELSE ISNULL(REPLACE(REPLACE(REPLACE(r.lifecycle,'&','&amp;'),'<','&lt;'),'>','&gt;'), 'N/A')
-              END
-        + N'</td>'
-
-      -- % Complete
-      + N'<td style="text-align:center;">'
-            + ISNULL(CAST(r.percent_complete AS NVARCHAR(10)) + '%', '&mdash;')
-        + N'</td>'
-
-          -- S3 Path (extract just the key after the bucket ARN for readability)
-      + N'<td style="word-break:break-all;font-size:11px;">'
-            + ISNULL(REPLACE(REPLACE(REPLACE(r.S3_object_arn,'&','&amp;'),'<','&lt;'),'>','&gt;'), '&mdash;')
-        + N'</td>'
-
-      -- Task Info (errors only to keep it clean)
-      + N'<td style="font-size:11px;color:#555;">'
-            + ISNULL(
-                REPLACE(REPLACE(REPLACE(
-                    REPLACE(REPLACE(r.task_info,'&','&amp;'),'<','&lt;'),'>','&gt;'),
-                    CHAR(13),''),
-                    CHAR(10),'<br/>'),
-                '&mdash;')
-        + N'</td>'
-
-           + N'</tr>'
-    FROM #Report r
-    ORDER BY r.StartTime, r.DatabaseName
-    FOR XML PATH(''), TYPE
-).value('.', 'NVARCHAR(MAX)');
-
-------------------------------------------------------------
--- 8) Assemble final HTML
-------------------------------------------------------------
-SET @Html = N'
-<html>
-<head>
-<style>
-  body {
-      font-family: Arial, Helvetica, sans-serif;
-      font-size: 13px;
-      color: #1a1a1a;
-      margin: 20px;
-      background: #f9fafb;
-  }
-  .title {
-      font-size: 20px;
-      font-weight: bold;
-      color: #1e3a5f;
-      margin-bottom: 6px;
-      border-bottom: 3px solid #1e3a5f;
-      padding-bottom: 6px;
-  }
-  
-.section-header {
-      background: #1e3a5f;
-      color: #ffffff;
-      font-size: 14px;
-      font-weight: bold;
-      padding: 8px 10px;
-      margin: 18px 0 0 0;
-      width: 100%;
-      box-sizing: border-box;
-  }
-
-  /* Summary card */
-  table.summary {
-      width: 420px;
-      border-collapse: collapse;
-      margin-bottom: 24px;
-      background: #fff;
-      border: 1px solid #d0d7de;
-      border-radius: 4px;
-  }
-  table.summary th {
-      background: #1e3a5f;
-      color: #fff;
-      padding: 10px 12px;
-      font-size: 14px;
-      text-align: left;
-  }
-  table.summary td {
-      padding: 7px 12px;
-      border-bottom: 1px solid #eee;
-      color: #333;
-  }
-  table.summary tr:last-child td { border-bottom: none; }
-  table.summary td:first-child    { color: #555; width: 180px; }
-
-  /* Detail table */
-  table.detail {
-      border-collapse: collapse;
-      width: 100%;
-      background: #fff;
-      border: 1px solid #d0d7de;
-  }
-  table.detail th {
-      background: #1e3a5f;
-      color: #fff;
-      padding: 9px 10px;
-      font-size: 12px;
-      text-align: left;
-      white-space: nowrap;
-  }
-  table.detail td {
-      padding: 8px 10px;
-      border-bottom: 1px solid #e5e7eb;
-      vertical-align: top;
-  }
-  table.detail tr:hover td { background: #f0f4ff; }
-
-  /* Row tinting */
-  tr.row-success  td { border-left: 4px solid #16a34a; }
-  tr.row-error    td { border-left: 4px solid #dc2626; background: #fff5f5; }
-  tr.row-progress td { border-left: 4px solid #d97706; background: #fffbeb; }
-  tr.row-cancelled td { border-left: 4px solid #6b7280; background: #f9fafb; }
-  tr.row-other    td { border-left: 4px solid #9ca3af; }
-
-  /* Badges */
-  .badge {
-      display: inline-block;
-      padding: 3px 10px;
-      border-radius: 12px;
-      font-size: 11px;
-      font-weight: bold;
-      white-space: nowrap;
-  }
-  .badge-success   { background: #dcfce7; color: #15803d; }
-  .badge-error     { background: #fee2e2; color: #b91c1c; }
-</style>
-</head>
-<body>
-
-<div class="title">RDS SQL Server Backup Status Report</div>
-
-' + @Summary + N'
-
-<div class="section-header">Monthly Database Backup Logs</div>
-
-<table class="detail">
-  <tr>
-    <th>Database</th>
-    <th>Task ID</th>
-    <th>Start Time</th>
-    <th>End Time</th>
-    <th>Duration</th>
-    <th>Status</th>
-    <th>% Done</th>
-    <th>S3 Object ARN</th>
-    <th>Task Info</th>
-   </tr>
-  ' + ISNULL(@Rows, N'<tr><td colspan="11" style="text-align:center;color:#888;">No backup records found for today.</td></tr>') + N'
-</table>
-
-</body>
-</html>';
-
-------------------------------------------------------------
--- 9) Status Database Mail 
-------------------------------------------------------------
-DECLARE @OverallStatus NVARCHAR(20);
-DECLARE @EmailSubject  NVARCHAR(500);
-
-SET @OverallStatus =
-    CASE
-        WHEN @ErrorCount      > 0 THEN 'FAILED'
-        WHEN @InProgressCount > 0
-          OR @CreatedCount    > 0 THEN 'IN_PROGRESS'
-        WHEN @SuccessCount = @TotalCount
-         AND @TotalCount   > 0    THEN 'SUCCESS'
-        ELSE 'UNKNOWN'
-    END;
-
-SET @EmailSubject =
-    '[' + @OverallStatus + '] PROD Monthly Backup Report - '
-    + CONVERT(VARCHAR, @ReportDate, 106)
-    + '  |  Total: ' + CAST(@TotalCount   AS VARCHAR)
-    + '  OK: '       + CAST(@SuccessCount AS VARCHAR)
-    + '  Fail: '     + CAST(@ErrorCount   AS VARCHAR)
-    + '  Pending: '  + CAST(@InProgressCount + @CreatedCount AS VARCHAR);
-
-    if @Html is not null
-    BEGIN
-        EXEC msdb.dbo.sp_send_dbmail
-        @profile_name = '',  -- Replace with your actual profile name
-	    @recipients = '',  -- Add the mail IDs
-        @subject = @EmailSubject,
-        @body = @html,
+    ------------------------------------------------------------
+    -- 7. Send Mail
+    ------------------------------------------------------------
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = 'YOUR_PROFILE',
+        @recipients = 'yourmail@company.com',
+        @subject = 'RDS Backup Report - ' + CONVERT(VARCHAR, @ReportDate, 106),
+        @body = @Html,
         @body_format = 'HTML';
-    END
 
-
-
-------------------------------------------------------------
--- 10) Cleanup
-------------------------------------------------------------
-DROP TABLE IF EXISTS #TaskList;
-DROP TABLE IF EXISTS #TaskStatus;
-DROP TABLE IF EXISTS #Report;
-    
 END
 GO
