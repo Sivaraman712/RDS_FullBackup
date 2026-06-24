@@ -253,55 +253,75 @@ BEGIN
   --// Original Copyright 2024 Ola Hallengren. Licensed under the MIT License.                    //-- 
   --// Modifications Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.           //-- 
     IF @AmazonRDS = 1
-	BEGIN
-      BEGIN TRY
-        EXECUTE @sp_executesql @stmt = @Command
-        
-        -- Retrieve created task status
-        DELETE FROM @RDSQueue;
-	  	INSERT INTO @RDSQueue exec msdb..rds_task_status @db_name=@DatabaseName;
-	    SELECT TOP 1 @task_id=task_id from @RDSQueue ORDER BY task_id DESC
-	    INSERT INTO dbo.RDS_BackupLog (ID, task_id, [Status]) VALUES (@ID, @task_id, 'CREATED')
+    BEGIN
+      -- Introduce a loop variable for retries
+      DECLARE @TaskSuccess BIT = 0;
+      
+      WHILE @TaskSuccess = 0
+      BEGIN
+        BEGIN TRY
+          -- 1. Attempt to execute the backup command
+          EXECUTE @sp_executesql @stmt = @Command;
+          
+          -- 2. Retrieve created task status
+          DELETE FROM @RDSQueue;
+          INSERT INTO @RDSQueue exec msdb..rds_task_status @db_name=@DatabaseName;
+          SELECT TOP 1 @task_id=task_id from @RDSQueue ORDER BY task_id DESC;
+          INSERT INTO dbo.RDS_BackupLog (ID, task_id, [Status]) VALUES (@ID, @task_id, 'CREATED');
 
-        -- Wait loop for sequential execution
-        DECLARE @TaskLifecycle nvarchar(max) = 'CREATED';
-        WHILE @TaskLifecycle IN ('CREATED', 'IN_PROGRESS')
-        BEGIN
-            WAITFOR DELAY '00:00:20'; -- Check task status every 20 seconds
-            DELETE FROM @RDSQueue;
-            INSERT INTO @RDSQueue EXEC msdb.dbo.rds_task_status @task_id = @task_id;
-            SELECT TOP 1 @TaskLifecycle = [lifecycle] FROM @RDSQueue WHERE [task_id] = @task_id;
-        END
+          -- 3. Wait loop for sequential execution
+          DECLARE @TaskLifecycle nvarchar(max) = 'CREATED';
+          WHILE @TaskLifecycle IN ('CREATED', 'IN_PROGRESS')
+          BEGIN
+              WAITFOR DELAY '00:01:00'; -- Check task status every 60 seconds
+              DELETE FROM @RDSQueue;
+              INSERT INTO @RDSQueue EXEC msdb.dbo.rds_task_status @task_id = @task_id;
+              SELECT TOP 1 @TaskLifecycle = [lifecycle] FROM @RDSQueue WHERE [task_id] = @task_id;
+          END
 
-        -- Update BackupLog with final status
-        UPDATE dbo.RDS_BackupLog SET [Status] = @TaskLifecycle WHERE ID = @ID AND task_id = @task_id;
+          -- 4. Update BackupLog with final status
+          UPDATE dbo.RDS_BackupLog SET [Status] = @TaskLifecycle WHERE ID = @ID AND task_id = @task_id;
 
-        -- Raise Error if task did not succeed
-        IF @TaskLifecycle IN ('ERROR', 'CANCELLED')
-        BEGIN
-            DECLARE @TaskError nvarchar(max);
-            SELECT TOP 1 @TaskError = [task_info] FROM @RDSQueue WHERE [task_id] = @task_id;
-            SET @ErrorMessageOriginal = 'RDS Task ' + CAST(@task_id AS nvarchar) + ' ' + @TaskLifecycle + '. Info: ' + ISNULL(@TaskError, '');
-            RAISERROR('%s', 16, 1, @ErrorMessageOriginal) WITH LOG;
-        END
+          -- 5. Raise Error if task did not succeed
+          IF @TaskLifecycle IN ('ERROR', 'CANCELLED')
+          BEGIN
+              DECLARE @TaskError nvarchar(max);
+              SELECT TOP 1 @TaskError = [task_info] FROM @RDSQueue WHERE [task_id] = @task_id;
+              SET @ErrorMessageOriginal = 'RDS Task ' + CAST(@task_id AS nvarchar) + ' ' + @TaskLifecycle + '. Info: ' + ISNULL(@TaskError, '');
+              RAISERROR('%s', 16, 1, @ErrorMessageOriginal) WITH LOG;
+          END
 
-      END TRY
-      BEGIN CATCH
-        SET @Error = ERROR_NUMBER()
-        SET @ErrorMessageOriginal = ISNULL(@ErrorMessageOriginal, ERROR_MESSAGE())
-		  BEGIN
-		  	SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(@ErrorMessageOriginal,'')
+          -- 6. If we reached this point without hitting the CATCH block, the task succeeded.
+          -- Set the flag to 1 to exit the WHILE loop.
+          SET @TaskSuccess = 1;
 
-            SET @Severity = CASE WHEN ERROR_NUMBER() IN(1205,1222) THEN @LockMessageSeverity ELSE 16 END
-			IF @ErrorMessageOriginal NOT LIKE 'A task has already been issued for database: %' 
-			  RAISERROR('%s',@Severity,1,@ErrorMessage) WITH LOG
-			ELSE
-			BEGIN
-			  SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(ERROR_MESSAGE(),'')
-			  RAISERROR('%s',@Severity,1,@ErrorMessage) WITH NOWAIT
-			END
-		  END
-      END CATCH
+        END TRY
+        BEGIN CATCH
+          SET @Error = ERROR_NUMBER();
+          SET @ErrorMessageOriginal = ISNULL(ERROR_MESSAGE(), '');
+          
+          -- Check if the error is the concurrency error
+          IF @ErrorMessageOriginal LIKE '%A task has already been issued for database:%' 
+          BEGIN
+            -- Log a gentle warning and wait 60 seconds before the loop retries
+            DECLARE @RetryMsg nvarchar(max) = 'RDS Task currently running for ' + QUOTENAME(@DatabaseName) + '. Waiting 60 seconds before retrying...';
+            RAISERROR('%s', 10, 1, @RetryMsg) WITH NOWAIT;
+            
+            WAITFOR DELAY '00:01:00';
+            -- @TaskSuccess remains 0, so the WHILE loop will execute the TRY block again.
+          END
+          ELSE
+          BEGIN
+            -- It is a legitimate, different error. Log it and break out of the loop.
+            SET @ErrorMessage = 'RDS:Msg ' + CAST(@Error AS nvarchar) + ', ' + @ErrorMessageOriginal;
+            SET @Severity = CASE WHEN @Error IN(1205,1222) THEN @LockMessageSeverity ELSE 16 END;
+            RAISERROR('%s', @Severity, 1, @ErrorMessage) WITH LOG;
+            
+            -- Set to 1 to break the loop so it doesn't retry an unfixable error infinitely
+            SET @TaskSuccess = 1; 
+          END
+        END CATCH
+      END
     END
 	ELSE
 	BEGIN
