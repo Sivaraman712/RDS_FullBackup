@@ -292,6 +292,10 @@ BEGIN
           END
 
           -- 6. If we reached this point without hitting the CATCH block, the task succeeded.
+          -- Clear any previous retry errors so they are NOT logged to dbo.RDS_CommandLog
+          SET @Error = 0;
+          SET @ErrorMessageOriginal = NULL;
+
           -- Set the flag to 1 to exit the WHILE loop.
           SET @TaskSuccess = 1;
 
@@ -303,7 +307,7 @@ BEGIN
           -- Check if the error is the concurrency error
           IF @ErrorMessageOriginal LIKE '%A task has already been issued for database:%' 
           BEGIN
-            -- Log a gentle warning and wait 30 seconds before the loop retries
+            -- Log a gentle warning and wait 60 seconds before the loop retries
             DECLARE @RetryMsg nvarchar(max) = 'RDS Task currently running for ' + QUOTENAME(@DatabaseName) + '. Waiting 60 seconds before retrying...';
             RAISERROR('%s', 10, 1, @RetryMsg) WITH NOWAIT;
             
@@ -323,12 +327,12 @@ BEGIN
         END CATCH
       END
     END
-	ELSE
-	BEGIN
+    ELSE
+    BEGIN
       EXECUTE @sp_executesql @stmt = @Command
       SET @Error = @@ERROR
-	  SET @ReturnCode = @Error
-	END  
+      SET @ReturnCode = @Error
+    END  
   ----------------------------------------------------------------------------------------------------  
   END
 
