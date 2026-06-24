@@ -1,4 +1,4 @@
-﻿SET ANSI_NULLS ON
+SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
 GO
@@ -256,15 +256,41 @@ BEGIN
 	BEGIN
       BEGIN TRY
         EXECUTE @sp_executesql @stmt = @Command
+        
+        -- Retrieve created task status
+        DELETE FROM @RDSQueue;
 	  	INSERT INTO @RDSQueue exec msdb..rds_task_status @db_name=@DatabaseName;
 	    SELECT TOP 1 @task_id=task_id from @RDSQueue ORDER BY task_id DESC
 	    INSERT INTO dbo.RDS_BackupLog (ID, task_id, [Status]) VALUES (@ID, @task_id, 'CREATED')
+
+        -- Wait loop for sequential execution
+        DECLARE @TaskLifecycle nvarchar(max) = 'CREATED';
+        WHILE @TaskLifecycle IN ('CREATED', 'IN_PROGRESS')
+        BEGIN
+            WAITFOR DELAY '00:00:20'; -- Check task status every 20 seconds
+            DELETE FROM @RDSQueue;
+            INSERT INTO @RDSQueue EXEC msdb.dbo.rds_task_status @task_id = @task_id;
+            SELECT TOP 1 @TaskLifecycle = [lifecycle] FROM @RDSQueue WHERE [task_id] = @task_id;
+        END
+
+        -- Update BackupLog with final status
+        UPDATE dbo.RDS_BackupLog SET [Status] = @TaskLifecycle WHERE ID = @ID AND task_id = @task_id;
+
+        -- Raise Error if task did not succeed
+        IF @TaskLifecycle IN ('ERROR', 'CANCELLED')
+        BEGIN
+            DECLARE @TaskError nvarchar(max);
+            SELECT TOP 1 @TaskError = [task_info] FROM @RDSQueue WHERE [task_id] = @task_id;
+            SET @ErrorMessageOriginal = 'RDS Task ' + CAST(@task_id AS nvarchar) + ' ' + @TaskLifecycle + '. Info: ' + ISNULL(@TaskError, '');
+            RAISERROR('%s', 16, 1, @ErrorMessageOriginal) WITH LOG;
+        END
+
       END TRY
       BEGIN CATCH
         SET @Error = ERROR_NUMBER()
-        SET @ErrorMessageOriginal = ERROR_MESSAGE()
+        SET @ErrorMessageOriginal = ISNULL(@ErrorMessageOriginal, ERROR_MESSAGE())
 		  BEGIN
-		  	SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(ERROR_MESSAGE(),'')
+		  	SET @ErrorMessage = 'RDS:Msg ' + CAST(ERROR_NUMBER() AS nvarchar) + ', ' + ISNULL(@ErrorMessageOriginal,'')
 
             SET @Severity = CASE WHEN ERROR_NUMBER() IN(1205,1222) THEN @LockMessageSeverity ELSE 16 END
 			IF @ErrorMessageOriginal NOT LIKE 'A task has already been issued for database: %' 
